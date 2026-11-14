@@ -1,0 +1,142 @@
+name: iOS validation and TestFlight
+permissions:
+  contents: read
+concurrency:
+  group: ios
+  cancel-in-progress: false
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 60
+    environment: appstore
+    env:
+      EXPO_PUBLIC_API_ORIGIN: https://zaidrama.com
+      EXPO_PUBLIC_IDENTITY_ORIGIN: https://account.ourzai.com
+      EXPO_PUBLIC_OIDC_CLIENT_ID: zaidrama
+      IOS_BUNDLE_IDENTIFIER: com.ourzai.zaidrama
+      IOS_BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+      CI: '1'
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    defaults:
+      run:
+        working-directory: private-source/mobile
+        shell: bash
+    steps:
+    - name: Validate revision
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        repository: z55183980-gif/zaidrama
+        ref: ${{ inputs.source_sha }}
+        path: private-source
+        ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+        fetch-depth: 1
+        show-progress: false
+        sparse-checkout: 'mobile
+
+          frontend/src/features/project-agent/protocol.ts
+
+          frontend/public/brand'
+        sparse-checkout-cone-mode: false
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: '24'
+    - name: Install dependencies
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-3.log\" 2>&1\ncorepack enable\npnpm install --frozen-lockfile\n\nPRIVATE\n\
+        then\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Validate client
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-4.log\" 2>&1\npnpm check\npnpm run expo:doctor\npnpm build\n\nPRIVATE\n\
+        then\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Generate native project
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-5.log\" 2>&1\npnpm exec expo prebuild --platform ios --no-install\n\
+        PRIVATE\nthen\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Install native dependencies
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-6.log\" 2>&1\npod install --project-directory=ios\nPRIVATE\nthen\n\
+        \  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Compile for iPhone simulator
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-7.log\" 2>&1\nxcodebuild -quiet -workspace ios/ZaiDrama.xcworkspace\
+        \ -scheme ZaiDrama \\\n  -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \\\n  -derivedDataPath\
+        \ \"$RUNNER_TEMP/ios-derived\" CODE_SIGNING_ALLOWED=NO \\\n  > \"$RUNNER_TEMP/ios-build.log\" 2>&1\n\nPRIVATE\nthen\n  echo '::error::Private\
+        \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Verify live callback before upload
+      if: inputs.upload_testflight
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-8.log\" 2>&1\npnpm preflight\nPRIVATE\nthen\n  echo '::error::Private\
+        \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Install signing material
+      if: inputs.upload_testflight
+      env:
+        BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+        BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+        P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-9.log\" 2>&1\npython3 scripts/signing.py\nPRIVATE\nthen\n  echo '::error::Private\
+        \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Archive and export
+      if: inputs.upload_testflight
+      env:
+        IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-10.log\" 2>&1\nxcodebuild -quiet archive -workspace ios/ZaiDrama.xcworkspace\
+        \ -scheme ZaiDrama \\\n  -configuration Release -destination 'generic/platform=iOS' \\\n  -archivePath \"$RUNNER_TEMP/ZaiDrama.xcarchive\"\
+        \ \\\n  DEVELOPMENT_TEAM=\"$IOS_TEAM_ID\" CODE_SIGN_STYLE=Manual \\\n  CODE_SIGN_IDENTITY='Apple Distribution' PROVISIONING_PROFILE_SPECIFIER=\"\
+        $PROFILE_UUID\" \\\n  > \"$RUNNER_TEMP/ios-archive.log\" 2>&1\nxcodebuild -quiet -exportArchive -archivePath \"$RUNNER_TEMP/ZaiDrama.xcarchive\"\
+        \ \\\n  -exportOptionsPlist \"$RUNNER_TEMP/ios-export.plist\" -exportPath \"$RUNNER_TEMP/ios-export\" \\\n  >> \"$RUNNER_TEMP/ios-archive.log\"\
+        \ 2>&1\n\nPRIVATE\nthen\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+    - name: Upload to TestFlight and wait for processing
+      if: inputs.upload_testflight
+      uses: apple-actions/upload-testflight-build@665328adbecbc3ad929d3da710696d928b8a7ba9
+      with:
+        app-path: ${{ runner.temp }}/ios-export/ZaiDrama.ipa
+        app-type: ios
+        issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
+        api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
+        api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        wait-for-processing: 'true'
+    - name: Encrypt failure diagnostics
+      if: failure()
+      shell: bash
+      working-directory: ${{ runner.temp }}
+      env:
+        PUBLIC_CERT: ${{ vars.DIAGNOSTICS_PUBLIC_CERT }}
+      run: 'set -euo pipefail
+
+        printf ''%s\n'' "$PUBLIC_CERT" > ios-diagnostics-cert.pem
+
+        tar -czf ios-diagnostics.tar.gz ios-*.log
+
+        openssl smime -encrypt -binary -aes-256-cbc -in ios-diagnostics.tar.gz -out ios-diagnostics.enc -outform DER ios-diagnostics-cert.pem
+
+        rm -f ios-diagnostics.tar.gz ios-diagnostics-cert.pem'
+    - name: Save encrypted diagnostics
+      if: failure()
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: encrypted-ios-diagnostics
+        path: ${{ runner.temp }}/ios-diagnostics.enc
+        retention-days: 1
+        if-no-files-found: ignore
+    - name: Remove signing material
+      if: always()
+      run: if [ -f scripts/signing.py ]; then python3 scripts/signing.py --cleanup; fi
+    - name: Remove private build files
+      if: always()
+      working-directory: ${{ github.workspace }}
+      shell: bash
+      run: 'rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/ios-derived" "$RUNNER_TEMP/ZaiDrama.xcarchive" "$RUNNER_TEMP/ios-export"
+
+        rm -f "$RUNNER_TEMP"/ios-*.log'
+    if: github.ref == 'refs/heads/main'
+'on':
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA from private ZaiDrama source
+        type: string
+        required: true
+      upload_testflight:
+        description: Upload after validation passes
+        type: boolean
+        default: false
