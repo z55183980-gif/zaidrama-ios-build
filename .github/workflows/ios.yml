@@ -39,6 +39,14 @@ jobs:
 
           frontend/src/features/project-agent/protocol.ts
 
+          frontend/src/features/creative-canvas/core/types.ts
+
+          frontend/src/features/creative-canvas/core/video-mode.ts
+
+          frontend/src/features/film-workspace/types.ts
+
+          frontend/src/types
+
           frontend/public/brand'
         sparse-checkout-cone-mode: false
     - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
