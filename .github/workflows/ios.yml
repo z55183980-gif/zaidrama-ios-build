@@ -66,7 +66,6 @@ jobs:
       run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-8.log\" 2>&1\npnpm preflight\nPRIVATE\nthen\n  echo '::error::Private\
         \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
     - name: Install signing material
-      if: inputs.upload_testflight
       env:
         BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
         BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
@@ -76,7 +75,6 @@ jobs:
       run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-9.log\" 2>&1\npython3 scripts/signing.py\nPRIVATE\nthen\n  echo '::error::Private\
         \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
     - name: Archive and export
-      if: inputs.upload_testflight
       env:
         IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
       run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-10.log\" 2>&1\nxcodebuild -quiet archive -workspace ios/ZaiDrama.xcworkspace\
