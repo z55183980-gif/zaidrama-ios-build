@@ -43,6 +43,16 @@ jobs:
 
           frontend/src/features/creative-canvas/core/video-mode.ts
 
+          frontend/src/features/creative-canvas/core/document.ts
+
+          frontend/src/features/creative-canvas/core/geometry.ts
+
+          frontend/src/features/creative-canvas/core/last-style.ts
+
+          frontend/src/features/creative-canvas/nodes/models.ts
+
+          frontend/src/features/creative-canvas/prompt-references.ts
+
           frontend/src/features/film-workspace/types.ts
 
           frontend/src/types
