@@ -96,6 +96,90 @@ jobs:
         api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
         api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
         wait-for-processing: 'true'
+    - name: Add build to TestFlight groups
+      if: inputs.upload_testflight
+      continue-on-error: true
+      shell: bash
+      env:
+        ASC_ISSUER_ID: ${{ vars.APPSTORE_ISSUER_ID }}
+        ASC_KEY_ID: ${{ vars.APPSTORE_API_KEY_ID }}
+        ASC_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+        TESTFLIGHT_GROUPS: ${{ vars.TESTFLIGHT_GROUPS }}
+      run: |
+        set -euo pipefail
+        python3 -m venv "$RUNNER_TEMP/asc-venv"
+        "$RUNNER_TEMP/asc-venv/bin/pip" install --quiet --disable-pip-version-check 'pyjwt[crypto]==2.10.1'
+        "$RUNNER_TEMP/asc-venv/bin/python" - <<'PY'
+        # Adds the uploaded build to TestFlight beta groups so testers get it without manual steps.
+        # TESTFLIGHT_GROUPS (repo variable, comma-separated names) limits the groups; empty means every group.
+        # Groups that already receive all builds are skipped; external groups also get a beta review submission.
+        import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+        import jwt
+
+        API = "https://api.appstoreconnect.apple.com/v1"
+        bundle_id = os.environ["IOS_BUNDLE_IDENTIFIER"]
+        build_number = os.environ["IOS_BUILD_NUMBER"]
+        wanted = {name.strip() for name in os.environ.get("TESTFLIGHT_GROUPS", "").split(",") if name.strip()}
+
+        def token():
+            now = int(time.time())
+            return jwt.encode({"iss": os.environ["ASC_ISSUER_ID"], "iat": now, "exp": now + 1200, "aud": "appstoreconnect-v1"},
+                              os.environ["ASC_PRIVATE_KEY"], algorithm="ES256", headers={"kid": os.environ["ASC_KEY_ID"], "typ": "JWT"})
+
+        def call(method, path, body=None):
+            request = urllib.request.Request(API + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                             headers={"Authorization": f"Bearer {token()}", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    raw = response.read()
+                    return response.status, json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as error:
+                return error.code, json.loads(error.read() or b"{}")
+
+        status, apps = call("GET", "/apps?" + urllib.parse.urlencode({"filter[bundleId]": bundle_id, "limit": 1}))
+        if status != 200 or not apps.get("data"):
+            sys.exit(f"::error::App {bundle_id} not found (HTTP {status})")
+        app_id = apps["data"][0]["id"]
+
+        build_id = None
+        for attempt in range(10):
+            status, builds = call("GET", "/builds?" + urllib.parse.urlencode({"filter[app]": app_id, "filter[version]": build_number, "limit": 5}))
+            if status == 200 and builds.get("data"):
+                build_id = builds["data"][0]["id"]
+                break
+            time.sleep(30)
+        if not build_id:
+            sys.exit(f"::error::Build {build_number} not found in App Store Connect")
+
+        status, groups = call("GET", f"/apps/{app_id}/betaGroups?limit=200")
+        if status != 200:
+            sys.exit(f"::error::Could not list TestFlight groups (HTTP {status})")
+        chosen = [group for group in groups.get("data", [])
+                  if (not wanted or group["attributes"]["name"] in wanted) and not group["attributes"].get("hasAccessToAllBuilds")]
+        missing = wanted - {group["attributes"]["name"] for group in groups.get("data", [])}
+        if missing:
+            print(f"::warning::TestFlight groups not found: {', '.join(sorted(missing))}")
+        if not chosen:
+            print("No TestFlight group needs this build added.")
+            sys.exit(0)
+
+        status, body = call("POST", f"/builds/{build_id}/relationships/betaGroups",
+                            {"data": [{"type": "betaGroups", "id": group["id"]} for group in chosen]})
+        if status not in (200, 204):
+            sys.exit(f"::error::Could not add build {build_number} to groups (HTTP {status}): {json.dumps(body)[:500]}")
+        print(f"Build {build_number} added to: {', '.join(group['attributes']['name'] for group in chosen)}")
+
+        if any(not group["attributes"].get("isInternalGroup") for group in chosen):
+            status, body = call("POST", "/betaAppReviewSubmissions",
+                                {"data": {"type": "betaAppReviewSubmissions", "relationships": {"build": {"data": {"type": "builds", "id": build_id}}}}})
+            if status in (200, 201):
+                print("Submitted for TestFlight beta review (external groups).")
+            elif status == 409:
+                print("Beta review submission already exists for this build.")
+            else:
+                print(f"::warning::Beta review submission failed (HTTP {status}): {json.dumps(body)[:500]}")
+        PY
+        rm -rf "$RUNNER_TEMP/asc-venv"
     - name: Encrypt failure diagnostics
       if: failure()
       shell: bash
