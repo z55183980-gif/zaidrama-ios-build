@@ -64,11 +64,6 @@ jobs:
     - name: Install native dependencies
       run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-6.log\" 2>&1\npod install --project-directory=ios\nPRIVATE\nthen\n\
         \  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Compile for iPhone simulator
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-7.log\" 2>&1\nxcodebuild -quiet -workspace ios/ZaiDrama.xcworkspace\
-        \ -scheme ZaiDrama \\\n  -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \\\n  -derivedDataPath\
-        \ \"$RUNNER_TEMP/ios-derived\" CODE_SIGNING_ALLOWED=NO \\\n  > \"$RUNNER_TEMP/ios-build.log\" 2>&1\n\nPRIVATE\nthen\n  echo '::error::Private\
-        \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
     - name: Verify live callback before upload
       if: inputs.upload_testflight
       run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-8.log\" 2>&1\npnpm preflight\nPRIVATE\nthen\n  echo '::error::Private\
@@ -131,7 +126,7 @@ jobs:
       if: always()
       working-directory: ${{ github.workspace }}
       shell: bash
-      run: 'rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/ios-derived" "$RUNNER_TEMP/ZaiDrama.xcarchive" "$RUNNER_TEMP/ios-export"
+      run: 'rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/ZaiDrama.xcarchive" "$RUNNER_TEMP/ios-export"
 
         rm -f "$RUNNER_TEMP"/ios-*.log'
     if: github.ref == 'refs/heads/main'

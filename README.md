@@ -7,6 +7,8 @@ Failed build logs are encrypted to the owner’s diagnostics certificate and exp
 after one day. The protected `appstore` environment permits only `main`.
 
 Dispatch `ios.yml` with a full `source_sha`. Leave `upload_testflight` false for
-client tests, native compilation and signed archive validation; set it true to
-upload after those checks. Validation-only archives are deleted after the run.
+client tests and signed device archive validation; set it true to
+upload after those checks. The workflow compiles for physical iOS devices during
+archiving and does not build a simulator app. Validation-only archives are
+deleted after the run.
 Real-device behavior and visual acceptance require human testing in TestFlight.
