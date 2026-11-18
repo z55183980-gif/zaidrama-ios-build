@@ -1,32 +1,50 @@
 name: iOS validation and TestFlight
+# Builds the native Swift app under ios/ in the private ZaiDrama source (modeled on zai-ios-build).
 permissions:
   contents: read
 concurrency:
-  group: ios
+  # A UI preview does not queue behind a full run.
+  group: ios-${{ inputs.ui_preview && 'preview' || 'full' }}
   cancel-in-progress: false
+'on':
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full commit SHA from private ZaiDrama source
+        type: string
+        required: true
+      upload_testflight:
+        description: Upload to TestFlight after the tests pass
+        type: boolean
+        default: false
+      ui_preview:
+        description: 'UI check: archive and upload at once, without tests. Not a release candidate'
+        type: boolean
+        default: false
 jobs:
   ios:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-26
     timeout-minutes: 60
     environment: appstore
     env:
-      EXPO_PUBLIC_API_ORIGIN: https://zaidrama.com
-      EXPO_PUBLIC_IDENTITY_ORIGIN: https://account.ourzai.com
-      EXPO_PUBLIC_OIDC_CLIENT_ID: zaidrama
-      IOS_BUNDLE_IDENTIFIER: com.ourzai.zaidrama
-      IOS_BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
-      CI: '1'
       SOURCE_SHA: ${{ inputs.source_sha }}
+      IOS_PROJECT: ios/ZaiDrama.xcodeproj
+      IOS_SCHEME: ZaiDrama
+      IOS_BUNDLE_ID: com.ourzai.zaidrama
     defaults:
       run:
-        working-directory: private-source/mobile
         shell: bash
     steps:
-    - name: Validate revision
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Validate requested revision
+      run: |
+        set -euo pipefail
+        if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+          echo '::error::A full 40-character commit SHA is required.'
+          exit 1
+        fi
+    - name: Fetch private native source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
         repository: z55183980-gif/zaidrama
@@ -35,79 +53,151 @@ jobs:
         ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
         fetch-depth: 1
         show-progress: false
-        sparse-checkout: 'mobile
-
-          frontend/src/features/project-agent/protocol.ts
-
-          frontend/src/features/creative-canvas/core/types.ts
-
-          frontend/src/features/creative-canvas/core/video-mode.ts
-
-          frontend/src/features/creative-canvas/core/document.ts
-
-          frontend/src/features/creative-canvas/core/geometry.ts
-
-          frontend/src/features/creative-canvas/core/last-style.ts
-
-          frontend/src/features/creative-canvas/nodes/models.ts
-
-          frontend/src/features/creative-canvas/prompt-references.ts
-
-          frontend/src/features/film-workspace/types.ts
-
-          frontend/src/types
-
-          frontend/public/brand'
+        sparse-checkout: |
+          /ios/
+          /frontend/public/brand/
         sparse-checkout-cone-mode: false
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
-      with:
-        node-version: '24'
-    - name: Install dependencies
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-3.log\" 2>&1\ncorepack enable\npnpm install --frozen-lockfile\n\nPRIVATE\n\
-        then\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Validate client
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-4.log\" 2>&1\npnpm check\npnpm run expo:doctor\npnpm build\n\nPRIVATE\n\
-        then\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Generate native project
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-5.log\" 2>&1\npnpm exec expo prebuild --platform ios --no-install\n\
-        PRIVATE\nthen\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Install native dependencies
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-6.log\" 2>&1\npod install --project-directory=ios\nPRIVATE\nthen\n\
-        \  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Verify live callback before upload
-      if: inputs.upload_testflight
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-8.log\" 2>&1\npnpm preflight\nPRIVATE\nthen\n  echo '::error::Private\
-        \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Install signing material
+    - name: Verify source and generated project
+      working-directory: private-source
+      run: |
+        if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-verify.log" 2>&1
+        test "$(git rev-parse HEAD)" = "$(printf '%s' "$SOURCE_SHA" | tr 'A-F' 'a-f')"
+        test -d "$(xcode-select -p)"
+        python3 ios/scripts/generate-native-project.py
+        git diff --exit-code -- ios/ZaiDrama.xcodeproj
+        python3 ios/scripts/check-native-project.py
+        PRIVATE
+        then
+          echo '::error::Private source validation failed; read the encrypted diagnostics.'
+          exit 1
+        fi
+    - name: Choose the simulator
+      if: ${{ !inputs.ui_preview }}
+      run: |
+        set -euo pipefail
+        device_id=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for v in d["devices"].values() for x in v if x["name"].startswith("iPhone")))')
+        echo "SIMULATOR_ID=$device_id" >> "$GITHUB_ENV"
+    - name: Compile application and tests
+      if: ${{ !inputs.ui_preview }}
+      working-directory: private-source
+      run: |
+        if ! xcodebuild -quiet build-for-testing -project "$IOS_PROJECT" -scheme "$IOS_SCHEME" \
+          -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+          -derivedDataPath "$RUNNER_TEMP/native-derived" \
+          ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+          > "$RUNNER_TEMP/native-build.log" 2>&1; then
+          echo '::error::Native compilation failed; read the encrypted diagnostics.'
+          exit 1
+        fi
+    - name: Run native tests
+      if: ${{ !inputs.ui_preview }}
+      working-directory: private-source
+      run: |
+        if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-tests.log" 2>&1
+        xcrun simctl bootstatus "$SIMULATOR_ID" -b
+        xcodebuild test-without-building -project "$IOS_PROJECT" -scheme "$IOS_SCHEME" \
+          -configuration Debug -destination "platform=iOS Simulator,id=$SIMULATOR_ID" \
+          -parallel-testing-enabled NO -test-timeouts-enabled YES \
+          -default-test-execution-time-allowance 60 -maximum-test-execution-time-allowance 90 \
+          -derivedDataPath "$RUNNER_TEMP/native-derived" \
+          -resultBundlePath "$RUNNER_TEMP/native-tests.xcresult" \
+          ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+        PRIVATE
+        then
+          echo '::error::Native tests failed; read the encrypted diagnostics.'
+          exit 1
+        fi
+    - name: Install and validate signing material
+      if: ${{ inputs.upload_testflight || inputs.ui_preview }}
       env:
         BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
-        BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
         P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
         KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-9.log\" 2>&1\npython3 scripts/signing.py\nPRIVATE\nthen\n  echo '::error::Private\
-        \ build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
-    - name: Archive and export
+      run: |
+        if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-signing.log" 2>&1
+        umask 077
+        : "${BUILD_CERTIFICATE_BASE64:?Missing certificate}" "${P12_PASSWORD:?Missing certificate password}"
+        : "${BUILD_PROVISION_PROFILE_BASE64:?Missing profile}" "${KEYCHAIN_PASSWORD:?Missing keychain password}" "${IOS_TEAM_ID:?Missing team}"
+        keychain_path="$RUNNER_TEMP/native-signing.keychain-db"
+        printf '%s' "$BUILD_CERTIFICATE_BASE64" | base64 -D > "$RUNNER_TEMP/native-certificate.p12"
+        printf '%s' "$BUILD_PROVISION_PROFILE_BASE64" | base64 -D > "$RUNNER_TEMP/native-profile.mobileprovision"
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+        security set-keychain-settings -lut 21600 "$keychain_path"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+        security import "$RUNNER_TEMP/native-certificate.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+        security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+        security list-keychains -d user -s "$keychain_path"
+        security cms -D -i "$RUNNER_TEMP/native-profile.mobileprovision" > "$RUNNER_TEMP/native-profile.plist"
+        python3 - <<'PY'
+        import datetime, os, pathlib, plistlib, uuid
+        temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+        profile = plistlib.loads((temp / 'native-profile.plist').read_bytes())
+        team = os.environ['IOS_TEAM_ID']
+        assert team in profile['TeamIdentifier']
+        entitlement = profile['Entitlements']
+        assert entitlement['application-identifier'] == profile['ApplicationIdentifierPrefix'][0] + '.' + os.environ['IOS_BUNDLE_ID']
+        assert not entitlement.get('get-task-allow', False)
+        assert 'ProvisionedDevices' not in profile and not profile.get('ProvisionsAllDevices')
+        assert profile['ExpirationDate'] > datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+        profile_id = profile['UUID']
+        uuid.UUID(profile_id)
+        with open(os.environ['GITHUB_ENV'], 'a') as env:
+            env.write('PROFILE_UUID=' + profile_id + '\n')
+        options = {'method': 'app-store-connect', 'signingStyle': 'manual', 'signingCertificate': 'Apple Distribution', 'teamID': team,
+                   'provisioningProfiles': {os.environ['IOS_BUNDLE_ID']: profile_id}, 'manageAppVersionAndBuildNumber': False, 'stripSwiftSymbols': True}
+        (temp / 'native-export.plist').write_bytes(plistlib.dumps(options))
+        for directory in ('Library/MobileDevice/Provisioning Profiles', 'Library/Developer/Xcode/UserData/Provisioning Profiles'):
+            destination = pathlib.Path.home() / directory
+            destination.mkdir(parents=True, exist_ok=True)
+            (destination / (profile_id + '.mobileprovision')).write_bytes((temp / 'native-profile.mobileprovision').read_bytes())
+        PY
+        PRIVATE
+        then
+          echo '::error::Signing setup failed; verify protected environment configuration.'
+          exit 1
+        fi
+    - name: Archive and export application
+      if: ${{ inputs.upload_testflight || inputs.ui_preview }}
+      working-directory: private-source
       env:
         IOS_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
-      run: "if ! bash -euo pipefail <<'PRIVATE' > \"$RUNNER_TEMP/ios-stage-10.log\" 2>&1\nxcodebuild -quiet archive -workspace ios/ZaiDrama.xcworkspace\
-        \ -scheme ZaiDrama \\\n  -configuration Release -destination 'generic/platform=iOS' \\\n  -archivePath \"$RUNNER_TEMP/ZaiDrama.xcarchive\"\
-        \ \\\n  DEVELOPMENT_TEAM=\"$IOS_TEAM_ID\" CODE_SIGN_STYLE=Manual \\\n  CODE_SIGN_IDENTITY='Apple Distribution' PROVISIONING_PROFILE_SPECIFIER=\"\
-        $PROFILE_UUID\" \\\n  > \"$RUNNER_TEMP/ios-archive.log\" 2>&1\nxcodebuild -quiet -exportArchive -archivePath \"$RUNNER_TEMP/ZaiDrama.xcarchive\"\
-        \ \\\n  -exportOptionsPlist \"$RUNNER_TEMP/ios-export.plist\" -exportPath \"$RUNNER_TEMP/ios-export\" \\\n  >> \"$RUNNER_TEMP/ios-archive.log\"\
-        \ 2>&1\n\nPRIVATE\nthen\n  echo '::error::Private build stage failed. See encrypted diagnostics.'\n  exit 1\nfi"
+        IOS_MARKETING_VERSION: ${{ vars.IOS_NATIVE_MARKETING_VERSION || '1.0.0' }}
+      run: |
+        if ! bash -euo pipefail <<'PRIVATE' > "$RUNNER_TEMP/native-archive.log" 2>&1
+        if (( GITHUB_RUN_NUMBER < 1 || GITHUB_RUN_NUMBER > 999800 || GITHUB_RUN_ATTEMPT < 1 || GITHUB_RUN_ATTEMPT > 99 )); then exit 1; fi
+        # Starts at 100.x.y, above the retired React Native builds (numbered <run>.<attempt>, last 26.1).
+        printf -v build_number '%d.%d.%d' "$(((GITHUB_RUN_NUMBER - 1) / 100 + 100))" "$(((GITHUB_RUN_NUMBER - 1) % 100))" "$GITHUB_RUN_ATTEMPT"
+        echo "BUILD_NUMBER=$build_number" >> "$GITHUB_ENV"
+        xcodebuild -quiet archive -project "$IOS_PROJECT" -scheme "$IOS_SCHEME" \
+          -configuration Release -archivePath "$RUNNER_TEMP/native-archive.xcarchive" \
+          -destination 'generic/platform=iOS' DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+          PRODUCT_BUNDLE_IDENTIFIER="$IOS_BUNDLE_ID" MARKETING_VERSION="$IOS_MARKETING_VERSION" \
+          CURRENT_PROJECT_VERSION="$build_number" CODE_SIGN_STYLE=Manual \
+          CODE_SIGN_IDENTITY='Apple Distribution' PROVISIONING_PROFILE_SPECIFIER="$PROFILE_UUID"
+        xcodebuild -quiet -exportArchive -archivePath "$RUNNER_TEMP/native-archive.xcarchive" \
+          -exportOptionsPlist "$RUNNER_TEMP/native-export.plist" -exportPath "$RUNNER_TEMP/native-export"
+        ipa_path=$(find "$RUNNER_TEMP/native-export" -maxdepth 1 -name '*.ipa' -print -quit)
+        test -n "$ipa_path"
+        echo "IPA_PATH=$ipa_path" >> "$GITHUB_ENV"
+        PRIVATE
+        then
+          echo '::error::Archive or export failed; read the encrypted diagnostics.'
+          exit 1
+        fi
     - name: Upload to TestFlight and wait for processing
-      if: inputs.upload_testflight
+      if: ${{ inputs.upload_testflight || inputs.ui_preview }}
       uses: apple-actions/upload-testflight-build@665328adbecbc3ad929d3da710696d928b8a7ba9
       with:
-        app-path: ${{ runner.temp }}/ios-export/ZaiDrama.ipa
+        app-path: ${{ env.IPA_PATH }}
         app-type: ios
         issuer-id: ${{ vars.APPSTORE_ISSUER_ID }}
         api-key-id: ${{ vars.APPSTORE_API_KEY_ID }}
         api-private-key: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
         wait-for-processing: 'true'
     - name: Add build to TestFlight groups
-      if: inputs.upload_testflight
+      if: ${{ inputs.upload_testflight || inputs.ui_preview }}
       continue-on-error: true
       shell: bash
       env:
@@ -127,8 +217,8 @@ jobs:
         import jwt
 
         API = "https://api.appstoreconnect.apple.com/v1"
-        bundle_id = os.environ["IOS_BUNDLE_IDENTIFIER"]
-        build_number = os.environ["IOS_BUILD_NUMBER"]
+        bundle_id = os.environ["IOS_BUNDLE_ID"]
+        build_number = os.environ["BUILD_NUMBER"]
         wanted = {name.strip() for name in os.environ.get("TESTFLIGHT_GROUPS", "").split(",") if name.strip()}
 
         def token():
@@ -192,46 +282,37 @@ jobs:
         rm -rf "$RUNNER_TEMP/asc-venv"
     - name: Encrypt failure diagnostics
       if: failure()
-      shell: bash
-      working-directory: ${{ runner.temp }}
       env:
         PUBLIC_CERT: ${{ vars.DIAGNOSTICS_PUBLIC_CERT }}
-      run: 'set -euo pipefail
-
-        printf ''%s\n'' "$PUBLIC_CERT" > ios-diagnostics-cert.pem
-
-        tar -czf ios-diagnostics.tar.gz ios-*.log
-
-        openssl smime -encrypt -binary -aes-256-cbc -in ios-diagnostics.tar.gz -out ios-diagnostics.enc -outform DER ios-diagnostics-cert.pem
-
-        rm -f ios-diagnostics.tar.gz ios-diagnostics-cert.pem'
+      run: |
+        set -euo pipefail
+        test -n "$PUBLIC_CERT"
+        printf '%s\n' "$PUBLIC_CERT" > "$RUNNER_TEMP/diagnostics-cert.pem"
+        cd "$RUNNER_TEMP"
+        files=()
+        for name in native-verify.log native-build.log native-tests.log native-signing.log native-archive.log; do
+          if [ -f "$name" ]; then files+=("$name"); fi
+        done
+        tar -czf native-diagnostics.tar.gz "${files[@]}"
+        openssl smime -encrypt -binary -aes-256-cbc -in native-diagnostics.tar.gz \
+          -out native-diagnostics.enc -outform DER diagnostics-cert.pem
+        rm -f native-diagnostics.tar.gz diagnostics-cert.pem
     - name: Save encrypted diagnostics
       if: failure()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: encrypted-ios-diagnostics
-        path: ${{ runner.temp }}/ios-diagnostics.enc
+        name: encrypted-native-diagnostics
+        path: ${{ runner.temp }}/native-diagnostics.enc
         retention-days: 1
         if-no-files-found: ignore
-    - name: Remove signing material
+    - name: Remove private build material
       if: always()
-      run: if [ -f scripts/signing.py ]; then python3 scripts/signing.py --cleanup; fi
-    - name: Remove private build files
-      if: always()
-      working-directory: ${{ github.workspace }}
-      shell: bash
-      run: 'rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/ZaiDrama.xcarchive" "$RUNNER_TEMP/ios-export"
-
-        rm -f "$RUNNER_TEMP"/ios-*.log'
-    if: github.ref == 'refs/heads/main'
-'on':
-  workflow_dispatch:
-    inputs:
-      source_sha:
-        description: Full commit SHA from private ZaiDrama source
-        type: string
-        required: true
-      upload_testflight:
-        description: Upload after validation passes
-        type: boolean
-        default: false
+      run: |
+        set +e
+        security delete-keychain "$RUNNER_TEMP/native-signing.keychain-db" >/dev/null 2>&1
+        if [[ "${PROFILE_UUID:-}" =~ ^[0-9A-Fa-f-]{36}$ ]]; then
+          rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+        fi
+        rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/native-derived" "$RUNNER_TEMP/native-tests.xcresult" "$RUNNER_TEMP/native-archive.xcarchive" "$RUNNER_TEMP/native-export"
+        rm -f "$RUNNER_TEMP"/native-*.log "$RUNNER_TEMP/native-certificate.p12" "$RUNNER_TEMP/native-profile.mobileprovision" "$RUNNER_TEMP/native-profile.plist" "$RUNNER_TEMP/native-export.plist"
+        exit 0
