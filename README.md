@@ -12,3 +12,21 @@ upload after those checks. The workflow compiles for physical iOS devices during
 archiving and does not build a simulator app. Validation-only archives are
 deleted after the run.
 Real-device behavior and visual acceptance require human testing in TestFlight.
+
+## Native Swift app (`ios-native.yml`)
+
+The Swift rewrite lives under `ios/` in the private source and is built by
+`ios-native.yml`, modeled on the Zai native workflow. Dispatch it on `main` with
+a full `source_sha` (any branch commit of the private source):
+
+- `upload_testflight` off, `ui_preview` off: generate and check the Xcode
+  project, compile for the simulator and run the XCTest suite.
+- `upload_testflight` on: the above, then sign, archive and upload.
+- `ui_preview` on: sign and upload at once, without tests. Not a release candidate.
+
+It uses the same `appstore` environment secrets and bundle identifier as
+`ios.yml`. Native build numbers start at `100.0.1`, above the React Native
+builds (`<run>.<attempt>`), so both can upload to the same app while the native
+app reaches parity. The marketing version defaults to `1.0.0` and can be set
+with the `IOS_NATIVE_MARKETING_VERSION` variable. Failure logs are encrypted to
+`DIAGNOSTICS_PUBLIC_CERT` and kept for one day, as for `ios.yml`.
