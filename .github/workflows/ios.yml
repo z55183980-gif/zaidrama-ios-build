@@ -69,6 +69,8 @@ jobs:
         PRIVATE
         then
           echo '::error::Private source validation failed; read the encrypted diagnostics.'
+          # Checker output only (assertion messages from ios/scripts/check-native-project.py), no source.
+          echo '--- validation errors ---'; grep -E 'AssertionError|Error:' "$RUNNER_TEMP/native-verify.log" | sed "s|$GITHUB_WORKSPACE/private-source/||g" | cut -c1-400 | head -40 || true
           exit 1
         fi
     - name: Choose the simulator
@@ -87,6 +89,8 @@ jobs:
           ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
           > "$RUNNER_TEMP/native-build.log" 2>&1; then
           echo '::error::Native compilation failed; read the encrypted diagnostics.'
+          # Error locations and messages only (path:line:col: error: message); no source lines.
+          echo '--- compiler errors ---'; grep -E '(^|/)[^ :]+:[0-9]+(:[0-9]+)?: (fatal )?error: |^error: ' "$RUNNER_TEMP/native-build.log" | sed -e "s|$GITHUB_WORKSPACE/private-source/||g" -e 's|^.*/ios/|ios/|' | cut -c1-400 | sort -u | head -300 || true
           exit 1
         fi
     - name: Run native tests
@@ -105,6 +109,8 @@ jobs:
         PRIVATE
         then
           echo '::error::Native tests failed; read the encrypted diagnostics.'
+          # Failing test locations and assertion messages only.
+          echo '--- test failures ---'; grep -E '(^|/)[^ :]+:[0-9]+(:[0-9]+)?: (fatal )?error: |^error: ' "$RUNNER_TEMP/native-tests.log" | sed -e "s|$GITHUB_WORKSPACE/private-source/||g" -e 's|^.*/ios/|ios/|' | cut -c1-400 | sort -u | head -200 || true
           exit 1
         fi
     - name: Install and validate signing material

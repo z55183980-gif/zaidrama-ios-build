@@ -4,8 +4,10 @@ This repository contains only a manual macOS build workflow for the native Swift
 ZaiDrama app. Application source (`ios/` and `frontend/public/brand/`) is fetched
 from the private ZaiDrama repository using a read-only deploy key. Source code,
 IPAs, signing material and plain build logs are never published here. The
-public log reports stage results only; when a run fails, its logs are saved as
-an artifact encrypted to `DIAGNOSTICS_PUBLIC_CERT` and kept for one day. The
+public log reports stage results and, when validation, compilation or tests
+fail, only the error locations and messages (`path:line:col: error: message`,
+paths relative to the source root; no source lines). Full logs are saved as an
+artifact encrypted to `DIAGNOSTICS_PUBLIC_CERT` and kept for one day. The
 protected `appstore` environment permits only `main`.
 
 Dispatch `ios.yml` on `main` with a full 40-character `source_sha` (any branch
