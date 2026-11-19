@@ -190,6 +190,8 @@ jobs:
         PRIVATE
         then
           echo '::error::Archive or export failed; read the encrypted diagnostics.'
+          # Error messages only (signing, entitlements, compile); paths made relative, no source lines.
+          echo '--- archive errors ---'; grep -E ': (fatal )?error: |^error: |^\*\* (ARCHIVE|EXPORT) FAILED' "$RUNNER_TEMP/native-archive.log" | sed -e "s|$GITHUB_WORKSPACE/private-source/||g" -e "s|$RUNNER_TEMP/||g" -e 's|^.*/ios/|ios/|' | cut -c1-400 | sort -u | head -100 || true
           exit 1
         fi
     - name: Upload to TestFlight and wait for processing
