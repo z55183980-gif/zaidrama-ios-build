@@ -1,0 +1,182 @@
+name: macOS desktop build
+run-name: macOS ${{ inputs.mode }} · ${{ inputs.source_sha }}
+
+'on':
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full reviewed commit SHA in the private ZaiDrama repository
+        type: string
+        required: true
+      mode:
+        description: Validate a reviewed commit or sign and notarize the current private main
+        type: choice
+        options: [qa, release]
+        default: qa
+
+permissions:
+  contents: read
+
+jobs:
+  mac:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    environment: appstore
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      MODE: ${{ inputs.mode }}
+      BUILD_NUMBER: ${{ github.run_number }}
+      NOTARY_PROFILE: zaidrama-macos-release
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate request
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$MODE" == qa || "$MODE" == release ]]
+
+      - name: Fetch reviewed private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: z55183980-gif/zaidrama
+          ref: ${{ inputs.mode == 'release' && 'refs/heads/main' || inputs.source_sha }}
+          path: private-source
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+          show-progress: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /desktop/macos/
+            /desktop/VERSION
+            /ios/Package.swift
+            /ios/ZaiDrama/Conversation/Markdown/
+            /frontend/public/brand/zaidrama-ios-1024.png
+
+      - name: Match the trusted source before executing it
+        working-directory: private-source
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo '::error::Source SHA mismatch. A release must specify the current private main commit.'
+            exit 1
+          fi
+          mkdir -m 700 "$RUNNER_TEMP/mac-logs"
+
+      - name: Compile and run the Mac test suites
+        working-directory: private-source
+        env:
+          ZAIDRAMA_TEST_KEYCHAIN: '1'
+        run: |
+          swift test --package-path desktop/macos > "$RUNNER_TEMP/mac-logs/tests.log" 2>&1
+
+      - name: Build and open the packaged Intel and Apple silicon app
+        working-directory: private-source
+        run: |
+          set -euo pipefail
+          exec > "$RUNNER_TEMP/mac-logs/build.log" 2>&1
+          desktop/macos/packaging/build-app.sh "$RUNNER_TEMP/mac-qa"
+          archive="$RUNNER_TEMP/mac-qa/ZaiDrama-macOS-universal.zip"
+          (cd "$RUNNER_TEMP/mac-qa" && shasum -a 256 -c ZaiDrama-macOS-universal.zip.sha256)
+          ditto -x -k "$archive" "$RUNNER_TEMP/mac-install"
+          xcrun swiftc -parse-as-library desktop/macos/packaging/CheckWorkspaceLaunch.swift -o "$RUNNER_TEMP/check-launch"
+          "$RUNNER_TEMP/check-launch" "$RUNNER_TEMP/mac-install/ZaiDrama.app"
+
+      - name: Install the Developer ID identity and notarization profile
+        if: inputs.mode == 'release'
+        env:
+          APPLE_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          ASC_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          ASC_KEY_ID: ${{ vars.APPSTORE_API_KEY_ID }}
+          ASC_ISSUER_ID: ${{ vars.APPSTORE_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$APPLE_TEAM_ID" == YU6GT6HQJ8 ]]
+          : "${CERTIFICATE_BASE64:?Missing Developer ID certificate}" "${P12_PASSWORD:?Missing certificate password}"
+          : "${ASC_PRIVATE_KEY:?Missing ASC API key}" "${ASC_KEY_ID:?Missing ASC key ID}" "${ASC_ISSUER_ID:?Missing ASC issuer}"
+          temp=$(mktemp -d)
+          trap 'rm -rf "$temp"' EXIT
+          keychain="$RUNNER_TEMP/mac-release.keychain-db"
+          password=$(openssl rand -hex 32)
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 5400 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$temp/sign.p12"
+          security import "$temp/sign.p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          printf '%s' "$ASC_PRIVATE_KEY" > "$temp/auth.p8"
+          xcrun notarytool store-credentials "$NOTARY_PROFILE" --keychain "$keychain" \
+            --key "$temp/auth.p8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" >/dev/null
+
+      - name: Sign, notarize and verify the final downloaded archive
+        if: inputs.mode == 'release'
+        working-directory: private-source
+        env:
+          APPLE_TEAM_ID: ${{ vars.IOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          exec > "$RUNNER_TEMP/mac-logs/release.log" 2>&1
+          export SIGNING_KEYCHAIN="$RUNNER_TEMP/mac-release.keychain-db"
+          desktop/macos/packaging/release-app.sh "$RUNNER_TEMP/mac-qa/ZaiDrama-macOS-universal.zip" "$RUNNER_TEMP/mac-release"
+          archive="$RUNNER_TEMP/mac-release/ZaiDrama-macOS-$(cat desktop/VERSION)-$BUILD_NUMBER-universal.zip"
+          CHECK_WORKSPACE_LAUNCH=1 desktop/macos/packaging/verify-installed-app.sh "$archive" "$archive.sha256"
+
+      - name: Encrypt the verified archive and checksum for maintainers
+        env:
+          RECIPIENT_CERT: ${{ vars.DIAGNOSTICS_PUBLIC_CERT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s\n' "$RECIPIENT_CERT" > "$RUNNER_TEMP/mac-recipient.pem"
+          cd "$RUNNER_TEMP/mac-$MODE"
+          printf '%s\n' "$SOURCE_SHA" > SOURCE_SHA
+          files=(*.zip *.sha256 SOURCE_SHA)
+          if [[ "$MODE" == release ]]; then files+=(notary-submission.json); fi
+          tar -cf - "${files[@]}" | openssl smime -encrypt -binary -aes-256-cbc -outform DER \
+            -out "$RUNNER_TEMP/mac-package.enc" "$RUNNER_TEMP/mac-recipient.pem"
+
+      - name: Save encrypted Mac app
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: mac-${{ inputs.mode }}-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/mac-package.enc
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Encrypt private diagnostics
+        if: failure()
+        env:
+          RECIPIENT_CERT: ${{ vars.DIAGNOSTICS_PUBLIC_CERT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ -d "$RUNNER_TEMP/mac-logs" ]] || exit 0
+          printf '%s\n' "$RECIPIENT_CERT" > "$RUNNER_TEMP/mac-recipient.pem"
+          tar -czf - -C "$RUNNER_TEMP/mac-logs" . | openssl smime -encrypt -binary -aes-256-cbc -outform DER \
+            -out "$RUNNER_TEMP/mac-diagnostics.enc" "$RUNNER_TEMP/mac-recipient.pem"
+
+      - name: Save encrypted diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-mac-diagnostics
+          path: ${{ runner.temp }}/mac-diagnostics.enc
+          retention-days: 1
+          if-no-files-found: ignore
+
+      - name: Remove ephemeral keychain and build files
+        if: always()
+        run: |
+          set -eu
+          keychain="$RUNNER_TEMP/mac-release.keychain-db"
+          if [[ -f "$keychain" ]]; then security delete-keychain "$keychain"; fi
+          rm -rf "$GITHUB_WORKSPACE/private-source" "$RUNNER_TEMP/mac-qa" "$RUNNER_TEMP/mac-install" \
+            "$RUNNER_TEMP/mac-release" "$RUNNER_TEMP/mac-logs"
+          rm -f "$RUNNER_TEMP/check-launch" "$RUNNER_TEMP/mac-recipient.pem" \
+            "$RUNNER_TEMP/mac-package.enc" "$RUNNER_TEMP/mac-diagnostics.enc"
