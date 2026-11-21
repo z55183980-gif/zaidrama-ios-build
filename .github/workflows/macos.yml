@@ -1,5 +1,5 @@
 name: macOS desktop build
-run-name: macOS ${{ inputs.mode }} · ${{ inputs.source_sha }}
+run-name: macOS ${{ inputs.mode }} Ãƒâ€šÃ‚Â· ${{ inputs.source_sha }}
 
 'on':
   workflow_dispatch:
@@ -21,6 +21,8 @@ jobs:
   mac:
     if: github.ref == 'refs/heads/main'
     runs-on: macos-26
+    outputs:
+      tag: ${{ steps.public_update.outputs.tag }}
     environment: appstore
     timeout-minutes: 90
     env:
@@ -85,6 +87,11 @@ jobs:
           xcrun swiftc -parse-as-library desktop/macos/packaging/CheckWorkspaceLaunch.swift -o "$RUNNER_TEMP/check-launch"
           "$RUNNER_TEMP/check-launch" "$RUNNER_TEMP/mac-install/ZaiDrama.app"
 
+      - name: Exercise an isolated in-app upgrade
+        working-directory: private-source
+        run: |
+          bash desktop/macos/packaging/test-sparkle-update.sh "$RUNNER_TEMP/mac-qa/ZaiDrama-macOS-universal.zip" > "$RUNNER_TEMP/mac-logs/update-test.log" 2>&1
+
       - name: Install the Developer ID identity and notarization profile
         if: inputs.mode == 'release'
         env:
@@ -127,6 +134,44 @@ jobs:
           desktop/macos/packaging/release-app.sh "$RUNNER_TEMP/mac-qa/ZaiDrama-macOS-universal.zip" "$RUNNER_TEMP/mac-release"
           archive="$RUNNER_TEMP/mac-release/ZaiDrama-macOS-$(cat desktop/VERSION)-$BUILD_NUMBER-universal.zip"
           CHECK_WORKSPACE_LAUNCH=1 desktop/macos/packaging/verify-installed-app.sh "$archive" "$archive.sha256"
+
+      - name: Sign the public update feed and stage the notarized installer
+        if: inputs.mode == 'release'
+        working-directory: private-source
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          exec > "$RUNNER_TEMP/mac-logs/appcast.log" 2>&1
+          public="$RUNNER_TEMP/mac-public"
+          mkdir -m 700 "$public"
+          version=$(cat desktop/VERSION)
+          archive="$RUNNER_TEMP/mac-release/ZaiDrama-macOS-$version-$BUILD_NUMBER-universal.zip"
+          # SwiftPM may extract only the framework. Use the signing tools from the same locked binary artifact.
+          package_version=$(jq -er '.pins[] | select(.identity=="sparkle") | .state.version' desktop/macos/Package.resolved)
+          manifest=$(find desktop/macos/.build/checkouts -maxdepth 2 -ipath '*/sparkle/Package.swift' -print)
+          checksum=$(sed -nE 's/^let checksum[[:space:]]*=[[:space:]]*"([0-9a-f]{64})".*/\1/p' "$manifest")
+          [[ "$package_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$checksum" =~ ^[0-9a-f]{64}$ ]]
+          tools="$RUNNER_TEMP/sparkle-tools"
+          curl -fsSL --retry 3 "https://github.com/sparkle-project/Sparkle/releases/download/$package_version/Sparkle-for-Swift-Package-Manager.zip" -o "$tools.zip"
+          echo "$checksum  $tools.zip" | shasum -a 256 -c -
+          ditto -x -k "$tools.zip" "$tools"
+          signer="$tools/bin/sign_update"
+          python3 desktop/macos/packaging/make-appcast.py --archive "$archive" --output "$public/appcast.xml" --sign-update "$signer"
+          cp "$archive" "$public/ZaiDrama-macOS-universal.zip"
+          echo "tag=macos-v$version-build.$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+        id: public_update
+
+      - name: Stage public distribution files
+        if: inputs.mode == 'release'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: public-mac-update
+          path: |
+            ${{ runner.temp }}/mac-public/appcast.xml
+            ${{ runner.temp }}/mac-public/ZaiDrama-macOS-universal.zip
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Encrypt the verified archive and checksum for maintainers
         env:
@@ -181,3 +226,47 @@ jobs:
             "$RUNNER_TEMP/mac-release" "$RUNNER_TEMP/mac-logs"
           rm -f "$RUNNER_TEMP/check-launch" "$RUNNER_TEMP/mac-recipient.pem" \
             "$RUNNER_TEMP/mac-package.enc" "$RUNNER_TEMP/mac-diagnostics.enc"
+
+  publish:
+    name: Publish the stable macOS update
+    if: inputs.mode == 'release'
+    needs: mac
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: publish-macos-stable
+      cancel-in-progress: false
+    steps:
+      - name: Download only public distribution files
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+        with:
+          name: public-mac-update
+          path: public
+      - name: Publish ZIP and feed together
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.mac.outputs.tag }}
+          BUILD: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^macos-v[0-9]+\.[0-9]+\.[0-9]+-build\.$BUILD$ ]]
+          latest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName,isLatest --jq '.[] | select(.isLatest) | .tagName')
+          if [[ "$latest" =~ ^macos-v.*-build\.([0-9]+)$ ]] && (( BASH_REMATCH[1] > BUILD )); then
+            echo "A newer build is already published." >&2
+            exit 1
+          fi
+          if gh release view "$TAG" --json isDraft > release-state.json 2>/dev/null; then
+            if [[ $(jq -r .isDraft release-state.json) == false ]]; then
+              mkdir existing
+              gh release download "$TAG" -D existing
+              cmp existing/appcast.xml public/appcast.xml
+              cmp existing/ZaiDrama-macOS-universal.zip public/ZaiDrama-macOS-universal.zip
+              exit 0
+            fi
+          else
+            gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "ZaiDrama for macOS (build $BUILD)" --notes "Signed and notarized universal macOS application."
+          fi
+          gh release upload "$TAG" public/appcast.xml public/ZaiDrama-macOS-universal.zip --clobber
+          gh release edit "$TAG" --draft=false --latest
