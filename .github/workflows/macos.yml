@@ -269,4 +269,9 @@ jobs:
             gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "ZaiDrama for macOS (build $BUILD)" --notes "Signed and notarized universal macOS application."
           fi
           gh release upload "$TAG" public/appcast.xml public/ZaiDrama-macOS-universal.zip --clobber
+          if [[ -n "$latest" && "$latest" != "$TAG" ]]; then
+            if gh release download "$latest" -p windows-latest.json -D "$RUNNER_TEMP" 2>/dev/null; then
+              gh release upload "$TAG" "$RUNNER_TEMP/windows-latest.json" --clobber
+            fi
+          fi
           gh release edit "$TAG" --draft=false --latest

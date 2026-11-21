@@ -1,0 +1,103 @@
+name: Windows update manifest
+run-name: Windows update · v${{ inputs.version }}+${{ inputs.build }}
+
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Three-part Windows version (e.g. 0.2.4)
+        type: string
+        required: true
+      build:
+        description: Positive integer build number
+        type: string
+        required: true
+        default: '1'
+      installer_url:
+        description: Public HTTPS URL of ZaiDrama-Windows-x64-Setup-<version>.exe (with .sha256 sidecar)
+        type: string
+        required: true
+      notes:
+        description: Optional release notes shown in the updater dialog
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-windows-update
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: appstore
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ inputs.version }}
+      BUILD: ${{ inputs.build }}
+      INSTALLER_URL: ${{ inputs.installer_url }}
+      NOTES: ${{ inputs.notes }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$ ]]
+          [[ "$BUILD" =~ ^[1-9][0-9]{0,8}$ ]]
+          [[ "$INSTALLER_URL" == https://* ]]
+
+      - name: Fetch manifest signer from private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: z55183980-gif/zaidrama
+          ref: refs/heads/main
+          path: private-source
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+          show-progress: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /desktop/windows/packaging/make_update_manifest.py
+
+      - name: Download installer and checksum
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/win"
+          name="ZaiDrama-Windows-x64-Setup-${VERSION}.exe"
+          curl -fsSL "$INSTALLER_URL" -o "$RUNNER_TEMP/win/$name"
+          curl -fsSL "${INSTALLER_URL}.sha256" -o "$RUNNER_TEMP/win/${name}.sha256"
+          (cd "$RUNNER_TEMP/win" && sha256sum --check "${name}.sha256")
+
+      - name: Sign windows-latest.json
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet cryptography
+          name="ZaiDrama-Windows-x64-Setup-${VERSION}.exe"
+          python3 private-source/desktop/windows/packaging/make_update_manifest.py \
+            --installer "$RUNNER_TEMP/win/$name" \
+            --output "$RUNNER_TEMP/win/windows-latest.json" \
+            --version "$VERSION" \
+            --build "$BUILD" \
+            --url "$INSTALLER_URL" \
+            --notes "$NOTES"
+          cat "$RUNNER_TEMP/win/windows-latest.json"
+
+      - name: Upload windows-latest.json to the latest public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName,isLatest --jq '.[] | select(.isLatest) | .tagName')
+          if [[ -z "$latest" ]]; then
+            echo "No latest release found in $GH_REPO" >&2
+            exit 1
+          fi
+          gh release upload "$latest" "$RUNNER_TEMP/win/windows-latest.json" --clobber
+          echo "Uploaded windows-latest.json to release $latest"
