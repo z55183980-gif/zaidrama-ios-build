@@ -110,6 +110,7 @@ jobs:
           printf '%s' "$CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$temp/sign.p12"
           security import "$temp/sign.p12" -k "$keychain" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
           security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain"
           printf '%s' "$ASC_PRIVATE_KEY" > "$temp/auth.p8"
           xcrun notarytool store-credentials "$NOTARY_PROFILE" --keychain "$keychain" \
             --key "$temp/auth.p8" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" >/dev/null
