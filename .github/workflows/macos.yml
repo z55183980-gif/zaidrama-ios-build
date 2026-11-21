@@ -1,5 +1,5 @@
 name: macOS desktop build
-run-name: macOS ${{ inputs.mode }} Ãƒâ€šÃ‚Â· ${{ inputs.source_sha }}
+run-name: macOS ${{ inputs.mode }} · ${{ inputs.source_sha }}
 
 'on':
   workflow_dispatch:
