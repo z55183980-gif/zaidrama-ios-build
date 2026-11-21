@@ -27,16 +27,16 @@ Real-device behavior and visual acceptance require human testing in TestFlight.
 
 ## macOS desktop
 
-Run `macos.yml` on this repositoryâ€™s `main` and supply a lowercase, full `source_sha` from the private ZaiDrama repository. The same protected `appstore` environment supplies the read-only source deploy key and the diagnostics recipientâ€™s public certificate. QA accepts reviewed private branch commits. Both modes run the macOS XCTest suites, build an Intel and Apple silicon application, verify the ZIP and open the packaged workspace through LaunchServices.
+Run `macos.yml` on this repository’s `main` and supply a lowercase, full `source_sha` from the private ZaiDrama repository. The same protected `appstore` environment supplies the read-only source deploy key and the diagnostics recipient’s public certificate. QA accepts reviewed private branch commits. Both modes run the macOS XCTest suites, build an Intel and Apple silicon application, verify the ZIP and open the packaged workspace through LaunchServices.
 
 - `qa` builds with an ad hoc signature and does not load signing credentials.
-- `release` requires the input SHA to match the current private `main`. It additionally loads `MACOS_DEVELOPER_ID_P12_BASE64` and `MACOS_DEVELOPER_ID_P12_PASSWORD` from `appstore` and uses the teamâ€™s existing App Store Connect key for notarization. The final archive must pass stapler, Gatekeeper and clean launch checks.
+- `release` requires the input SHA to match the current private `main`. It additionally loads `MACOS_DEVELOPER_ID_P12_BASE64` and `MACOS_DEVELOPER_ID_P12_PASSWORD` from `appstore` and uses the team’s existing App Store Connect key for notarization. The final archive must pass stapler, Gatekeeper and clean launch checks.
 
 ```sh
 gh workflow run macos.yml -R z55183980-gif/zaidrama-ios-build --ref main -f source_sha="$SOURCE_SHA" -f mode=qa
 ```
 
-After a successful run, download the `mac-<mode>-<sha>` artifact. Use the private key corresponding to the environmentâ€™s `DIAGNOSTICS_PUBLIC_CERT`. The decrypted tar contains the application ZIP, its SHA-256 checksum, the source SHA and, for a release, the notarization receipt. Failed builds provide a separate encrypted gzip-compressed tar of diagnostics. The private key stays with its holder.
+After a successful run, download the `mac-<mode>-<sha>` artifact. Use the private key corresponding to the environment’s `DIAGNOSTICS_PUBLIC_CERT`. The decrypted tar contains the application ZIP, its SHA-256 checksum, the source SHA and, for a release, the notarization receipt. Failed builds provide a separate encrypted gzip-compressed tar of diagnostics. The private key stays with its holder.
 
 ```sh
 gh run download "$RUN_ID" -R z55183980-gif/zaidrama-ios-build -n "mac-$MODE-$SOURCE_SHA" -D result
