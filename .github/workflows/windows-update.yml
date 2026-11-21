@@ -61,6 +61,7 @@ jobs:
           show-progress: false
           sparse-checkout-cone-mode: false
           sparse-checkout: |
+            /desktop/windows/VERSION
             /desktop/windows/packaging/make_update_manifest.py
 
       - name: Download installer and checksum
