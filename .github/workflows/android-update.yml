@@ -1,0 +1,117 @@
+name: Android update manifest
+run-name: Android update · v${{ inputs.version }}+${{ inputs.build }}
+
+'on':
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Three-part Android SemVer (e.g. 1.0.7)
+        type: string
+        required: true
+      build:
+        description: Android versionCode integer (e.g. 9)
+        type: string
+        required: true
+      apk_url:
+        description: Public HTTPS URL of ZaiDrama-<version>.apk (with .sha256 sidecar)
+        type: string
+        required: true
+      notes_zh:
+        description: Release notes (Simplified Chinese)
+        type: string
+        required: false
+        default: ''
+      notes_zh_hk:
+        description: Release notes (Traditional Chinese)
+        type: string
+        required: false
+        default: ''
+      notes_en:
+        description: Release notes (English)
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-android-update
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: appstore
+    timeout-minutes: 15
+    env:
+      VERSION: ${{ inputs.version }}
+      BUILD: ${{ inputs.build }}
+      APK_URL: ${{ inputs.apk_url }}
+      NOTES_ZH: ${{ inputs.notes_zh }}
+      NOTES_ZH_HK: ${{ inputs.notes_zh_hk }}
+      NOTES_EN: ${{ inputs.notes_en }}
+    steps:
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})\.(0|[1-9][0-9]{0,4})$ ]]
+          [[ "$BUILD" =~ ^[1-9][0-9]{0,8}$ ]]
+          [[ "$APK_URL" == https://* ]]
+
+      - name: Fetch manifest signer from private source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: z55183980-gif/zaidrama
+          ref: refs/heads/main
+          path: private-source
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+          show-progress: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /android/scripts/make_update_manifest.py
+
+      - name: Download signed APK and verify checksum
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/android"
+          name="ZaiDrama-${VERSION}.apk"
+          curl -fsSL "$APK_URL" -o "$RUNNER_TEMP/android/$name"
+          curl -fsSL "${APK_URL}.sha256" -o "$RUNNER_TEMP/android/${name}.sha256"
+          (cd "$RUNNER_TEMP/android" && sha256sum --check "${name}.sha256")
+
+      - name: Sign android-latest.json
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet cryptography
+          name="ZaiDrama-${VERSION}.apk"
+          python3 private-source/android/scripts/make_update_manifest.py \
+            --apk "$RUNNER_TEMP/android/$name" \
+            --output "$RUNNER_TEMP/android/android-latest.json" \
+            --version "$VERSION" \
+            --build "$BUILD" \
+            --url "$APK_URL" \
+            --notes "$NOTES_ZH" \
+            --notes-zh "$NOTES_ZH" \
+            --notes-zh-hk "$NOTES_ZH_HK" \
+            --notes-en "$NOTES_EN"
+          cat "$RUNNER_TEMP/android/android-latest.json"
+
+      - name: Upload android-latest.json to the latest public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 --json tagName,isLatest --jq '.[] | select(.isLatest) | .tagName')
+          if [[ -z "$latest" ]]; then
+            echo "No latest release found in $GH_REPO" >&2
+            exit 1
+          fi
+          gh release upload "$latest" "$RUNNER_TEMP/android/android-latest.json" --clobber
+          echo "Uploaded android-latest.json to release $latest"
